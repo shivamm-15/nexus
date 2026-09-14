@@ -1,4 +1,7 @@
-# Nexus Arena
+
+Website-https://shivamm-15.github.io/nexus/public/index.html
+
+# Nexus 
 
 **A distributed, real-time multiplayer game server** — matchmaking, horizontally-scaled game servers coordinated through Redis, server-side lag compensation, stateful reconnection, and a live observability dashboard, all built from scratch in Node.js.
 
