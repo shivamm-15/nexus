@@ -1,3 +1,17 @@
+// The matchmaker is a standalone process.
+// Players connect here ONLY to queue.
+//
+// Once matched:
+//   1. Matchmaker selects the least-loaded game server.
+//   2. Matchmaker tells that server to create the session through Redis.
+//   3. Matchmaker gives the browser the PUBLIC WebSocket URL of that server.
+//
+// Local:
+//   node server/matchmakerService.js
+//
+// Render:
+//   node server/matchmakerService.js
+
 const WebSocket = require('ws');
 const http = require('http');
 const crypto = require('crypto');
@@ -6,7 +20,8 @@ const { makeRedisClient } = require('./redisClient');
 const PORT = Number(process.env.PORT) || 9000;
 
 const PUBLIC_WS_URL =
-  process.env.PUBLIC_WS_URL || `ws://localhost:${PORT}`;
+  process.env.PUBLIC_WS_URL ||
+  `ws://localhost:${PORT}`;
 
 const MIN_PLAYERS = 2;
 const MAX_PLAYERS = 4;
@@ -15,6 +30,10 @@ const CHECK_INTERVAL_MS = 500;
 
 let nextPlayerId = 1;
 let nextSessionNumber = 1;
+
+// --------------------------------------------------
+// Metrics
+// --------------------------------------------------
 
 const metrics = {
   startedAt: Date.now(),
@@ -37,68 +56,108 @@ function avg(arr) {
     : 0;
 }
 
+// --------------------------------------------------
+// Main
+// --------------------------------------------------
+
 async function main() {
   const redis = await makeRedisClient('matchmaker');
 
   /*
    * IMPORTANT:
-   * HTTP server and WebSocket server share the SAME Render port.
+   *
+   * Render gives the Web Service one public PORT.
+   *
+   * HTTP + WebSocket must use this SAME port.
    */
-  const server = http.createServer((req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-
-    if (req.url === '/health') {
-      res.writeHead(200, {
-        'Content-Type': 'text/plain',
-      });
-
-      res.end('Matchmaker OK');
-      return;
-    }
-
-    if (req.url === '/metrics') {
-      res.writeHead(200, {
-        'Content-Type': 'application/json',
-      });
-
-      res.end(
-        JSON.stringify({
-          uptimeSec: Math.round(
-            (Date.now() - metrics.startedAt) / 1000
-          ),
-          queueLength: queue.length,
-          matchesFormed: metrics.matchesFormed,
-          totalPlayersMatched: metrics.totalPlayersMatched,
-          avgAssignmentWaitMs: Math.round(
-            avg(metrics.assignmentWaitSamplesMs)
-          ),
-        })
+  const httpServer = http.createServer(
+    (req, res) => {
+      res.setHeader(
+        'Access-Control-Allow-Origin',
+        '*'
       );
 
-      return;
+      // Health check
+      if (req.url === '/health') {
+        res.writeHead(200, {
+          'Content-Type': 'text/plain',
+        });
+
+        res.end('Matchmaker OK');
+        return;
+      }
+
+      // Metrics
+      if (req.url === '/metrics') {
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+        });
+
+        res.end(
+          JSON.stringify({
+            uptimeSec: Math.round(
+              (Date.now() - metrics.startedAt) / 1000
+            ),
+
+            queueLength: queue.length,
+
+            matchesFormed:
+              metrics.matchesFormed,
+
+            totalPlayersMatched:
+              metrics.totalPlayersMatched,
+
+            avgAssignmentWaitMs:
+              Math.round(
+                avg(
+                  metrics.assignmentWaitSamplesMs
+                )
+              ),
+          })
+        );
+
+        return;
+      }
+
+      res.writeHead(404);
+      res.end();
     }
+  );
 
-    res.writeHead(404);
-    res.end();
-  });
-
+  /*
+   * WebSocket server attached to the SAME
+   * HTTP server.
+   */
   const wss = new WebSocket.Server({
-    server,
+    server: httpServer,
   });
 
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(
-      `Matchmaker listening on ${PUBLIC_WS_URL}`
-    );
+  httpServer.listen(
+    PORT,
+    '0.0.0.0',
+    () => {
+      console.log(
+        `Matchmaker listening on ${PUBLIC_WS_URL}`
+      );
 
-    console.log(
-      `Matchmaker HTTP server listening on port ${PORT}`
-    );
-  });
+      console.log(
+        `Matchmaker HTTP/WebSocket port: ${PORT}`
+      );
+    }
+  );
+
+  // --------------------------------------------------
+  // Queue
+  // --------------------------------------------------
 
   const queue = [];
 
+  // id -> websocket
   const connections = new Map();
+
+  // --------------------------------------------------
+  // Player connection
+  // --------------------------------------------------
 
   wss.on('connection', (ws) => {
     const id = nextPlayerId++;
@@ -126,7 +185,12 @@ async function main() {
       }
 
       if (msg.type === 'find_match') {
-        if (queue.some((q) => q.id === id)) {
+        // Already queued
+        if (
+          queue.some(
+            (q) => q.id === id
+          )
+        ) {
           return;
         }
 
@@ -152,9 +216,10 @@ async function main() {
     ws.on('close', () => {
       connections.delete(id);
 
-      const idx = queue.findIndex(
-        (q) => q.id === id
-      );
+      const idx =
+        queue.findIndex(
+          (q) => q.id === id
+        );
 
       if (idx !== -1) {
         queue.splice(idx, 1);
@@ -166,55 +231,78 @@ async function main() {
     });
   });
 
+  // --------------------------------------------------
+  // Game server selection
+  // --------------------------------------------------
+
   /*
-   * Track assignments that happened before
-   * the next Redis heartbeat arrives.
+   * Prevent several matches from being assigned
+   * to the same server before its next heartbeat.
    */
-  const pendingAssignments = new Map();
+  const pendingAssignments =
+    new Map();
 
   async function pickGameServer() {
-    const keys = await redis.keys(
-      'gameserver:*:info'
-    );
+    const keys =
+      await redis.keys(
+        'gameserver:*:info'
+      );
 
     if (keys.length === 0) {
       return null;
     }
 
-    const infos = await Promise.all(
-      keys.map((k) => redis.get(k))
-    );
+    const infos =
+      await Promise.all(
+        keys.map((k) =>
+          redis.get(k)
+        )
+      );
 
-    const servers = infos
-      .filter(Boolean)
-      .map((raw) => JSON.parse(raw));
+    const servers =
+      infos
+        .filter(Boolean)
+        .map((raw) =>
+          JSON.parse(raw)
+        );
 
     if (servers.length === 0) {
       return null;
     }
 
     for (const server of servers) {
-      const pending = pendingAssignments.get(
-        server.id
-      );
+      const pending =
+        pendingAssignments.get(
+          server.id
+        );
 
       if (pending) {
-        if (server.updatedAt > pending.since) {
-          pendingAssignments.delete(server.id);
+        if (
+          server.updatedAt >
+          pending.since
+        ) {
+          // Fresh heartbeat arrived.
+          pendingAssignments.delete(
+            server.id
+          );
 
-          server.effectiveLoad = server.load;
+          server.effectiveLoad =
+            server.load;
         } else {
           server.effectiveLoad =
-            server.load + pending.count;
+            server.load +
+            pending.count;
         }
       } else {
-        server.effectiveLoad = server.load;
+        server.effectiveLoad =
+          server.load;
       }
     }
 
     servers.sort(
       (a, b) =>
-        a.effectiveLoad - b.effectiveLoad
+        a.effectiveLoad -
+        b.effectiveLoad
     );
 
     return servers[0];
@@ -225,19 +313,29 @@ async function main() {
     count
   ) {
     const existing =
-      pendingAssignments.get(serverId);
+      pendingAssignments.get(
+        serverId
+      );
 
-    pendingAssignments.set(serverId, {
-      count:
-        (existing ? existing.count : 0) + count,
-      since: Date.now(),
-    });
+    pendingAssignments.set(
+      serverId,
+      {
+        count:
+          (existing
+            ? existing.count
+            : 0) + count,
+
+        since: Date.now(),
+      }
+    );
   }
 
+  // --------------------------------------------------
+  // Matchmaking loop
+  // --------------------------------------------------
+
   async function checkQueue() {
-    /*
-     * Remove disconnected players.
-     */
+    // Remove disconnected players
     for (
       let i = queue.length - 1;
       i >= 0;
@@ -256,7 +354,8 @@ async function main() {
     }
 
     const oldestWait =
-      Date.now() - queue[0].queuedAt;
+      Date.now() -
+      queue[0].queuedAt;
 
     const shouldStart =
       queue.length >= MAX_PLAYERS ||
@@ -280,27 +379,35 @@ async function main() {
       return;
     }
 
-    const matchSize = Math.min(
-      MAX_PLAYERS,
-      queue.length
-    );
+    const matchSize =
+      Math.min(
+        MAX_PLAYERS,
+        queue.length
+      );
 
     const matchedPlayers =
-      queue.splice(0, matchSize);
+      queue.splice(
+        0,
+        matchSize
+      );
 
     const sessionId =
       `s${nextSessionNumber++}`;
 
     const playersWithTokens =
-      matchedPlayers.map((p) => ({
-        id: p.id,
-        token: crypto
-          .randomBytes(8)
-          .toString('hex'),
-      }));
+      matchedPlayers.map(
+        (p) => ({
+          id: p.id,
+
+          token:
+            crypto
+              .randomBytes(8)
+              .toString('hex'),
+        })
+      );
 
     console.log(
-      `Assigning session ${sessionId} (${playersWithTokens.length} players) to ${server.id}`
+      `Assigning session ${sessionId} (${playersWithTokens.length} players) to ${server.id} (load was ${server.load})`
     );
 
     metrics.matchesFormed++;
@@ -308,9 +415,12 @@ async function main() {
     metrics.totalPlayersMatched +=
       matchedPlayers.length;
 
-    for (const p of matchedPlayers) {
+    for (
+      const p of matchedPlayers
+    ) {
       recordAssignmentWait(
-        Date.now() - p.queuedAt
+        Date.now() -
+        p.queuedAt
       );
     }
 
@@ -319,35 +429,58 @@ async function main() {
       matchedPlayers.length
     );
 
-    /*
-     * Tell the selected game server to create
-     * the session.
-     */
+    // --------------------------------------------------
+    // Tell selected game server to create session
+    // --------------------------------------------------
+
     await redis.publish(
       `gameserver:${server.id}:commands`,
       JSON.stringify({
         type: 'create_session',
         sessionId,
-        players: playersWithTokens,
+        players:
+          playersWithTokens,
       })
     );
 
-    /*
-     * Tell the browser the PUBLIC WebSocket URL.
-     */
-    for (const p of matchedPlayers) {
+    // --------------------------------------------------
+    // Give browser its game-server ticket
+    // --------------------------------------------------
+
+    for (
+      const p of matchedPlayers
+    ) {
       const tokenEntry =
         playersWithTokens.find(
-          (t) => t.id === p.id
+          (t) =>
+            t.id === p.id
         );
 
       p.ws.send(
         JSON.stringify({
-          type: 'match_assigned',
-          sessionId,
-          playerId: p.id,
-          token: tokenEntry.token,
+          type:
+            'match_assigned',
 
+          sessionId,
+
+          playerId:
+            p.id,
+
+          token:
+            tokenEntry.token,
+
+          /*
+           * IMPORTANT:
+           *
+           * Previously:
+           *   host + port
+           *
+           * Now:
+           *   public WebSocket URL
+           *
+           * Example:
+           *   wss://gs1-c4fn.onrender.com
+           */
           server: {
             id: server.id,
             url: server.url,
@@ -358,14 +491,19 @@ async function main() {
   }
 
   setInterval(() => {
-    checkQueue().catch((err) => {
-      console.error(
-        'checkQueue error:',
-        err
-      );
-    });
+    checkQueue().catch(
+      (err) =>
+        console.error(
+          'checkQueue error:',
+          err
+        )
+    );
   }, CHECK_INTERVAL_MS);
 }
+
+// --------------------------------------------------
+// Start
+// --------------------------------------------------
 
 main().catch((err) => {
   console.error(

@@ -2,363 +2,1465 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
+
 <title>Stage 3 - Distributed Matchmaking + Reconnection</title>
+
 <style>
-  body { margin: 0; background: #111; display: flex; flex-direction: column; align-items: center; font-family: monospace; color: #eee; }
-  canvas { background: #1c1c1c; border: 2px solid #444; margin-top: 20px; display: none; }
-  #hud { margin-top: 12px; font-size: 14px; text-align: center; }
-  #lobby { margin-top: 60px; text-align: center; }
-  button { font-family: monospace; font-size: 16px; padding: 10px 24px; background: #4ade80; border: none; border-radius: 6px; cursor: pointer; margin: 4px; }
-  button:disabled { background: #555; cursor: default; }
-  #debugBtn { background: #f59e0b; font-size: 12px; padding: 6px 12px; }
-  .reconnect-banner { background: #7c2d12; color: #fed7aa; padding: 6px 14px; border-radius: 4px; margin-top: 8px; display:none; }
+  body {
+    margin: 0;
+    background: #111;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    font-family: monospace;
+    color: #eee;
+  }
+
+  canvas {
+    background: #1c1c1c;
+    border: 2px solid #444;
+    margin-top: 20px;
+    display: none;
+  }
+
+  #hud {
+    margin-top: 12px;
+    font-size: 14px;
+    text-align: center;
+  }
+
+  #lobby {
+    margin-top: 60px;
+    text-align: center;
+  }
+
+  button {
+    font-family: monospace;
+    font-size: 16px;
+    padding: 10px 24px;
+    background: #4ade80;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    margin: 4px;
+  }
+
+  button:disabled {
+    background: #555;
+    cursor: default;
+  }
+
+  #debugBtn {
+    background: #f59e0b;
+    font-size: 12px;
+    padding: 6px 12px;
+  }
+
+  .reconnect-banner {
+    background: #7c2d12;
+    color: #fed7aa;
+    padding: 6px 14px;
+    border-radius: 4px;
+    margin-top: 8px;
+    display: none;
+  }
 </style>
+
 </head>
+
 <body>
-  <div id="hud">Connecting to matchmaker...</div>
 
-  <div id="lobby">
-    <button id="findMatchBtn" disabled>Find Match</button>
-    <p id="lobbyStatus" style="color:#888"></p>
-  </div>
+<div id="hud">Connecting to matchmaker...</div>
 
-  <div id="reconnectBanner" class="reconnect-banner">Connection lost — reconnecting to your match...</div>
-  <canvas id="game" width="800" height="600"></canvas>
-  <p id="helpText" style="font-size:13px;color:#888;display:none">WASD to move, click to shoot.</p>
-  <button id="debugBtn" style="display:none">Simulate disconnect (test reconnection)</button>
+<div id="lobby">
+
+  <button id="findMatchBtn" disabled>
+    Find Match
+  </button>
+
+  <p id="lobbyStatus" style="color:#888"></p>
+
+</div>
+
+<div id="reconnectBanner" class="reconnect-banner">
+  Connection lost — reconnecting to your match...
+</div>
+
+<canvas id="game" width="800" height="600"></canvas>
+
+<p
+  id="helpText"
+  style="font-size:13px;color:#888;display:none"
+>
+  WASD to move, click to shoot.
+</p>
+
+<button id="debugBtn" style="display:none">
+  Simulate disconnect (test reconnection)
+</button>
+
 
 <script>
+
+/* =========================================================
+   DOM ELEMENTS
+========================================================= */
+
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
+
 const hud = document.getElementById('hud');
 const lobby = document.getElementById('lobby');
 const lobbyStatus = document.getElementById('lobbyStatus');
-const findMatchBtn = document.getElementById('findMatchBtn');
-const helpText = document.getElementById('helpText');
-const reconnectBanner = document.getElementById('reconnectBanner');
-const debugBtn = document.getElementById('debugBtn');
 
-// ---- Matchmaker connection (only used to queue) ----
-// ---- Deployment config ----
-// Locally this just works. After you deploy the matchmaker somewhere
-// public, replace the string below with its real wss:// URL — everything
-// else (which game server to connect to, ws vs wss) is told to the client
-// by the matchmaker automatically, so this is the ONE line you need to edit.
-const MATCHMAKER_URL = 'wss://matchmaker-6wmh.onrender.com'; // deployed matchmaker
+const findMatchBtn =
+  document.getElementById('findMatchBtn');
+
+const helpText =
+  document.getElementById('helpText');
+
+const reconnectBanner =
+  document.getElementById('reconnectBanner');
+
+const debugBtn =
+  document.getElementById('debugBtn');
+
+
+/* =========================================================
+   MATCHMAKER CONNECTION
+========================================================= */
+
+const MATCHMAKER_URL =
+  'wss://matchmaker-6wmh.onrender.com';
 
 let mmWs = new WebSocket(MATCHMAKER_URL);
 
-// ---- Game server connection (created after a match is assigned) ----
+
+/* =========================================================
+   GAME CONNECTION / MATCH STATE
+========================================================= */
+
 let gameWs = null;
+
 let myId = null;
-let matchInfo = null; // { sessionId, playerId, token, server }
+
+let matchInfo = null;
+// {
+//   sessionId,
+//   playerId,
+//   token,
+//   server: {
+//      id,
+//      url
+//   }
+// }
+
 let inMatch = false;
+
 let cleanEnd = false;
+
 let reconnectAttempts = 0;
+
 const MAX_RECONNECT_ATTEMPTS = 6;
 
-let latestState = { players: [], bullets: [] };
-let railgunEffects = []; // { from, to, hit, expiresAt }
-let killFeed = []; // { text, expiresAt }
+
+/* =========================================================
+   GAME STATE
+========================================================= */
+
+let latestState = {
+  players: [],
+  bullets: []
+};
+
+let railgunEffects = [];
+// { from, to, hit, expiresAt }
+
+let killFeed = [];
+// { text, expiresAt }
+
 let myLatencyMs = 0;
-let predicted = { x: 400, y: 300, initialized: false };
+
+
+/* =========================================================
+   CLIENT PREDICTION
+========================================================= */
+
+let predicted = {
+  x: 400,
+  y: 300,
+  initialized: false
+};
+
 const PLAYER_SPEED = 200;
 const PLAYER_RADIUS = 15;
-let ARENA_W = 800, ARENA_H = 600;
+
+let ARENA_W = 800;
+let ARENA_H = 600;
+
+
+/* =========================================================
+   MATCHMAKER EVENTS
+========================================================= */
 
 mmWs.onopen = () => {
-  hud.textContent = 'Connected to matchmaker. Ready to find a match.';
+
+  hud.textContent =
+    'Connected to matchmaker. Ready to find a match.';
+
   findMatchBtn.disabled = false;
+
 };
+
+
 mmWs.onclose = () => {
-  if (!inMatch) hud.textContent = 'Disconnected from matchmaker.';
+
+  if (!inMatch) {
+
+    hud.textContent =
+      'Disconnected from matchmaker.';
+
+  }
+
 };
+
+
+mmWs.onerror = () => {
+
+  if (!inMatch) {
+
+    hud.textContent =
+      'Could not connect to matchmaker.';
+
+  }
+
+};
+
+
+/* =========================================================
+   FIND MATCH
+========================================================= */
 
 findMatchBtn.addEventListener('click', () => {
-  mmWs.send(JSON.stringify({ type: 'find_match' }));
+
+  if (
+    mmWs.readyState !== WebSocket.OPEN
+  ) {
+    hud.textContent =
+      'Matchmaker connection is not open.';
+
+    return;
+  }
+
+  mmWs.send(
+    JSON.stringify({
+      type: 'find_match'
+    })
+  );
+
   findMatchBtn.disabled = true;
-  lobbyStatus.textContent = 'Searching for match...';
+
+  lobbyStatus.textContent =
+    'Searching for match...';
+
 });
 
+
+/* =========================================================
+   MATCHMAKER MESSAGES
+========================================================= */
+
 mmWs.onmessage = (event) => {
+
   const msg = JSON.parse(event.data);
 
+
+  /* ---------------------------------------------------------
+     WELCOME
+  --------------------------------------------------------- */
+
   if (msg.type === 'welcome') {
+
     myId = msg.id;
-    hud.textContent = `Connected as player ${myId}`;
+
+    hud.textContent =
+      `Connected as player ${myId}`;
+
   }
+
+
+  /* ---------------------------------------------------------
+     QUEUED
+  --------------------------------------------------------- */
 
   if (msg.type === 'queued') {
-    lobbyStatus.textContent = `In queue (position ${msg.position})...`;
+
+    lobbyStatus.textContent =
+      `In queue (position ${msg.position})...`;
+
   }
+
+
+  /* ---------------------------------------------------------
+     MATCH ASSIGNED
+  --------------------------------------------------------- */
 
   if (msg.type === 'match_assigned') {
-    matchInfo = { sessionId: msg.sessionId, playerId: msg.playerId, token: msg.token, server: msg.server };
-lobbyStatus.textContent =
-  `Match found on ${msg.server.id} — connecting...`;   
-   connectToGameServer();
+
+    matchInfo = {
+      sessionId: msg.sessionId,
+      playerId: msg.playerId,
+      token: msg.token,
+      server: msg.server
+    };
+
+
+    /*
+      IMPORTANT:
+
+      Old version used:
+
+      msg.server.host
+      msg.server.port
+
+      That caused:
+
+      ws://localhost:10000
+
+      on the player's browser.
+
+      New matchmaker sends:
+
+      server: {
+        id,
+        url
+      }
+
+      Example:
+
+      {
+        id: "gs1",
+        url: "wss://gs1-c4fn.onrender.com"
+      }
+    */
+
+    lobbyStatus.textContent =
+      `Match found on ${msg.server.id} — connecting...`;
+
+
+    connectToGameServer();
+
   }
+
 };
 
+
+/* =========================================================
+   CONNECT TO GAME SERVER
+========================================================= */
+
 function connectToGameServer() {
+
   cleanEnd = false;
-gameWs = new WebSocket(
-  matchInfo.server.url
-);
+
+
+  if (
+    !matchInfo ||
+    !matchInfo.server ||
+    !matchInfo.server.url
+  ) {
+
+    hud.textContent =
+      'Invalid game server information received.';
+
+    console.error(
+      'Invalid matchInfo:',
+      matchInfo
+    );
+
+    return;
+  }
+
+
+  /*
+    IMPORTANT:
+
+    We DO NOT construct:
+
+    ws://host:port
+
+    anymore.
+
+    We directly use the public URL sent
+    by the matchmaker.
+
+    Example:
+
+    wss://gs1-c4fn.onrender.com
+  */
+
+  console.log(
+    'Connecting to game server:',
+    matchInfo.server.url
+  );
+
+
+  gameWs = new WebSocket(
+    matchInfo.server.url
+  );
+
+
+  /* =======================================================
+     GAME SERVER OPEN
+  ======================================================= */
+
   gameWs.onopen = () => {
+
+    console.log(
+      'Connected to game server:',
+      matchInfo.server.url
+    );
+
+
     gameWs.send(
       JSON.stringify({
         type: 'join_session',
         sessionId: matchInfo.sessionId,
         playerId: matchInfo.playerId,
-        token: matchInfo.token,
+        token: matchInfo.token
       })
     );
+
   };
 
+
+  /* =======================================================
+     GAME SERVER MESSAGE
+  ======================================================= */
+
   gameWs.onmessage = (event) => {
+
     const msg = JSON.parse(event.data);
 
+
+    /* -----------------------------------------------------
+       JOIN FAILED
+    ----------------------------------------------------- */
+
     if (msg.type === 'join_failed') {
-      hud.textContent = `Failed to join match: ${msg.reason}`;
+
+      hud.textContent =
+        `Failed to join match: ${msg.reason}`;
+
+      console.error(
+        'Join failed:',
+        msg.reason
+      );
+
       return;
     }
 
+
+    /* -----------------------------------------------------
+       MATCH FOUND
+    ----------------------------------------------------- */
+
     if (msg.type === 'match_found') {
+
       ARENA_W = msg.arena.w;
       ARENA_H = msg.arena.h;
+
       inMatch = true;
+
       reconnectAttempts = 0;
-      predicted.x = msg.yourState.x;
-      predicted.y = msg.yourState.y;
+
+
+      predicted.x =
+        msg.yourState.x;
+
+      predicted.y =
+        msg.yourState.y;
+
       predicted.initialized = true;
+
+
       lobby.style.display = 'none';
+
       canvas.style.display = 'block';
+
       helpText.style.display = 'block';
+
       debugBtn.style.display = 'inline-block';
+
       reconnectBanner.style.display = 'none';
-hud.textContent =
-  `Match ${msg.sessionId} on ${matchInfo.server.id}`;    }
+
+
+      hud.textContent =
+        `Match ${msg.sessionId} on ${matchInfo.server.id}`;
+
+    }
+
+
+    /* -----------------------------------------------------
+       GAME STATE
+    ----------------------------------------------------- */
 
     if (msg.type === 'state') {
+
       latestState = msg;
-      const serverSelf = msg.players.find((p) => p.id === matchInfo.playerId);
+
+
+      const serverSelf =
+        msg.players.find(
+          (p) =>
+            p.id === matchInfo.playerId
+        );
+
+
       if (serverSelf) {
-        const errX = serverSelf.x - predicted.x;
-        const errY = serverSelf.y - predicted.y;
-        const errMag = Math.sqrt(errX * errX + errY * errY);
+
+        const errX =
+          serverSelf.x - predicted.x;
+
+        const errY =
+          serverSelf.y - predicted.y;
+
+
+        const errMag =
+          Math.sqrt(
+            errX * errX +
+            errY * errY
+          );
+
+
+        /*
+          HARD RECONCILIATION
+        */
+
         if (errMag > 80) {
-          predicted.x = serverSelf.x;
-          predicted.y = serverSelf.y;
-        } else if (errMag > 2) {
-          predicted.x += errX * 0.2;
-          predicted.y += errY * 0.2;
+
+          predicted.x =
+            serverSelf.x;
+
+          predicted.y =
+            serverSelf.y;
+
         }
-        myLatencyMs = serverSelf.latencyMs || 0;
+
+
+        /*
+          SMOOTH RECONCILIATION
+        */
+
+        else if (errMag > 2) {
+
+          predicted.x +=
+            errX * 0.2;
+
+          predicted.y +=
+            errY * 0.2;
+
+        }
+
+
+        myLatencyMs =
+          serverSelf.latencyMs || 0;
+
       }
+
     }
 
-    // Server periodically checks our round-trip time — just echo it back
+
+    /* -----------------------------------------------------
+       SERVER PING
+    ----------------------------------------------------- */
+
     if (msg.type === 'ping') {
-      gameWs.send(JSON.stringify({ type: 'pong', pingId: msg.pingId }));
+
+      if (
+        gameWs &&
+        gameWs.readyState === WebSocket.OPEN
+      ) {
+
+        gameWs.send(
+          JSON.stringify({
+            type: 'pong',
+            pingId: msg.pingId
+          })
+        );
+
+      }
+
     }
 
-    // A railgun (hitscan) shot fired by anyone — draw a brief flash line
+
+    /* -----------------------------------------------------
+       RAILGUN SHOT
+    ----------------------------------------------------- */
+
     if (msg.type === 'railgun_shot') {
-      railgunEffects.push({ from: msg.from, to: msg.to, hit: !!msg.hitPlayerId, expiresAt: Date.now() + 180 });
+
+      railgunEffects.push({
+
+        from: msg.from,
+
+        to: msg.to,
+
+        hit: !!msg.hitPlayerId,
+
+        expiresAt:
+          Date.now() + 180
+
+      });
+
     }
+
+
+    /* -----------------------------------------------------
+       MATCH END
+    ----------------------------------------------------- */
 
     if (msg.type === 'match_end') {
+
       cleanEnd = true;
+
       inMatch = false;
+
+
       canvas.style.display = 'none';
+
       helpText.style.display = 'none';
+
       debugBtn.style.display = 'none';
+
       reconnectBanner.style.display = 'none';
+
       lobby.style.display = 'block';
+
       findMatchBtn.disabled = false;
 
-      const scoreLines = (msg.finalScores || [])
-        .map((s) => `P${s.id}: ${s.score}${s.id === msg.winnerId ? ' \u2b50' : ''}`)
-        .join('  |  ');
-      lobbyStatus.textContent = `Match ended (${msg.reason}). Final scores — ${scoreLines || 'no kills'}. Ready for another.`;
+
+      const scoreLines =
+        (msg.finalScores || [])
+
+          .map(
+            (s) =>
+              `P${s.id}: ${s.score}${
+                s.id === msg.winnerId
+                  ? ' ⭐'
+                  : ''
+              }`
+          )
+
+          .join('  |  ');
+
+
+      lobbyStatus.textContent =
+        `Match ended (${msg.reason}). ` +
+        `Final scores — ` +
+        `${scoreLines || 'no kills'}. ` +
+        `Ready for another.`;
+
+
       matchInfo = null;
+
     }
+
+
+    /* -----------------------------------------------------
+       KILL FEED
+    ----------------------------------------------------- */
 
     if (msg.type === 'kill_feed') {
-      const isRailgun = msg.weapon === 'railgun';
+
+      const isRailgun =
+        msg.weapon === 'railgun';
+
+
       killFeed.push({
-        text: `P${msg.killerId} eliminated P${msg.victimId} (${isRailgun ? 'railgun' : 'bullet'})`,
-        expiresAt: Date.now() + 4000,
+
+        text:
+          `P${msg.killerId} eliminated ` +
+          `P${msg.victimId} ` +
+          `(${isRailgun ? 'railgun' : 'bullet'})`,
+
+        expiresAt:
+          Date.now() + 4000
+
       });
-      if (killFeed.length > 5) killFeed.shift();
+
+
+      if (killFeed.length > 5) {
+
+        killFeed.shift();
+
+      }
+
     }
+
   };
+
+
+  /* =======================================================
+     GAME SERVER CLOSED
+  ======================================================= */
 
   gameWs.onclose = () => {
-    if (!cleanEnd && inMatch && matchInfo) {
+
+    console.log(
+      'Game server connection closed.'
+    );
+
+
+    if (
+      !cleanEnd &&
+      inMatch &&
+      matchInfo
+    ) {
+
       attemptReconnect();
+
     }
+
   };
+
+
+  /* =======================================================
+     GAME SERVER ERROR
+  ======================================================= */
+
+  gameWs.onerror = (error) => {
+
+    console.error(
+      'Game server WebSocket error:',
+      error
+    );
+
+  };
+
 }
+
+
+/* =========================================================
+   RECONNECTION
+========================================================= */
 
 function attemptReconnect() {
+
   reconnectAttempts++;
-  if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-    hud.textContent = 'Could not reconnect to match. Giving up.';
-    reconnectBanner.style.display = 'none';
+
+
+  if (
+    reconnectAttempts >
+    MAX_RECONNECT_ATTEMPTS
+  ) {
+
+    hud.textContent =
+      'Could not reconnect to match. Giving up.';
+
+    reconnectBanner.style.display =
+      'none';
+
     inMatch = false;
-    canvas.style.display = 'none';
-    lobby.style.display = 'block';
-    findMatchBtn.disabled = false;
+
+    canvas.style.display =
+      'none';
+
+    lobby.style.display =
+      'block';
+
+    findMatchBtn.disabled =
+      false;
+
     return;
+
   }
-  reconnectBanner.style.display = 'block';
-  reconnectBanner.textContent = `Connection lost — reconnecting (attempt ${reconnectAttempts})...`;
-  setTimeout(() => connectToGameServer(), 1000);
+
+
+  reconnectBanner.style.display =
+    'block';
+
+
+  reconnectBanner.textContent =
+    `Connection lost — reconnecting ` +
+    `(attempt ${reconnectAttempts})...`;
+
+
+  setTimeout(
+    () => connectToGameServer(),
+    1000
+  );
+
 }
 
-// Debug button: forcibly closes the game connection to test the
-// reconnection flow without needing to actually kill your network.
-debugBtn.addEventListener('click', () => {
-  if (gameWs) gameWs.close();
-});
 
-// ---- Input handling ----
-const keys = { up: false, down: false, left: false, right: false };
-let aim = { x: 400, y: 300 };
+/* =========================================================
+   DEBUG RECONNECTION BUTTON
+========================================================= */
 
-window.addEventListener('keydown', (e) => setKey(e.code, true));
-window.addEventListener('keyup', (e) => setKey(e.code, false));
+debugBtn.addEventListener(
+  'click',
+  () => {
 
-function setKey(code, isDown) {
-  if (code === 'KeyW' || code === 'ArrowUp') keys.up = isDown;
-  if (code === 'KeyS' || code === 'ArrowDown') keys.down = isDown;
-  if (code === 'KeyA' || code === 'ArrowLeft') keys.left = isDown;
-  if (code === 'KeyD' || code === 'ArrowRight') keys.right = isDown;
+    if (gameWs) {
+
+      gameWs.close();
+
+    }
+
+  }
+);
+
+
+/* =========================================================
+   INPUT HANDLING
+========================================================= */
+
+const keys = {
+
+  up: false,
+
+  down: false,
+
+  left: false,
+
+  right: false
+
+};
+
+
+let aim = {
+
+  x: 400,
+
+  y: 300
+
+};
+
+
+/* =========================================================
+   KEYBOARD
+========================================================= */
+
+window.addEventListener(
+  'keydown',
+  (e) =>
+    setKey(
+      e.code,
+      true
+    )
+);
+
+
+window.addEventListener(
+  'keyup',
+  (e) =>
+    setKey(
+      e.code,
+      false
+    )
+);
+
+
+function setKey(
+  code,
+  isDown
+) {
+
+  if (
+    code === 'KeyW' ||
+    code === 'ArrowUp'
+  ) {
+
+    keys.up = isDown;
+
+  }
+
+
+  if (
+    code === 'KeyS' ||
+    code === 'ArrowDown'
+  ) {
+
+    keys.down = isDown;
+
+  }
+
+
+  if (
+    code === 'KeyA' ||
+    code === 'ArrowLeft'
+  ) {
+
+    keys.left = isDown;
+
+  }
+
+
+  if (
+    code === 'KeyD' ||
+    code === 'ArrowRight'
+  ) {
+
+    keys.right = isDown;
+
+  }
+
 }
 
-canvas.addEventListener('mousemove', (e) => {
-  const rect = canvas.getBoundingClientRect();
-  aim = { x: e.clientX - rect.left, y: e.clientY - rect.top };
-});
 
-canvas.addEventListener('click', () => {
-  if (inMatch && gameWs && gameWs.readyState === WebSocket.OPEN) {
-    gameWs.send(JSON.stringify({ type: 'shoot' }));
+/* =========================================================
+   MOUSE AIM
+========================================================= */
+
+canvas.addEventListener(
+  'mousemove',
+  (e) => {
+
+    const rect =
+      canvas.getBoundingClientRect();
+
+
+    aim = {
+
+      x:
+        e.clientX -
+        rect.left,
+
+      y:
+        e.clientY -
+        rect.top
+
+    };
+
   }
-});
+);
 
-// Right-click fires the lag-compensated hitscan railgun instead of a projectile
-canvas.addEventListener('contextmenu', (e) => {
-  e.preventDefault();
-  if (inMatch && gameWs && gameWs.readyState === WebSocket.OPEN) {
-    gameWs.send(JSON.stringify({ type: 'railgun' }));
+
+/* =========================================================
+   LEFT CLICK = NORMAL SHOOT
+========================================================= */
+
+canvas.addEventListener(
+  'click',
+  () => {
+
+    if (
+      inMatch &&
+      gameWs &&
+      gameWs.readyState ===
+        WebSocket.OPEN
+    ) {
+
+      gameWs.send(
+        JSON.stringify({
+          type: 'shoot'
+        })
+      );
+
+    }
+
   }
-});
+);
 
-setInterval(() => {
-  if (inMatch && gameWs && gameWs.readyState === WebSocket.OPEN) {
-    gameWs.send(JSON.stringify({ type: 'input', keys, aim }));
+
+/* =========================================================
+   RIGHT CLICK = RAILGUN
+========================================================= */
+
+canvas.addEventListener(
+  'contextmenu',
+  (e) => {
+
+    e.preventDefault();
+
+
+    if (
+      inMatch &&
+      gameWs &&
+      gameWs.readyState ===
+        WebSocket.OPEN
+    ) {
+
+      gameWs.send(
+        JSON.stringify({
+          type: 'railgun'
+        })
+      );
+
+    }
+
   }
-}, 50);
+);
 
-let lastFrameTime = Date.now();
+
+/* =========================================================
+   SEND INPUT TO SERVER
+========================================================= */
+
+setInterval(
+  () => {
+
+    if (
+      inMatch &&
+      gameWs &&
+      gameWs.readyState ===
+        WebSocket.OPEN
+    ) {
+
+      gameWs.send(
+        JSON.stringify({
+          type: 'input',
+          keys,
+          aim
+        })
+      );
+
+    }
+
+  },
+  50
+);
+
+
+/* =========================================================
+   CLIENT PREDICTION
+========================================================= */
+
+let lastFrameTime =
+  Date.now();
+
+
 function applyPrediction() {
-  const now = Date.now();
-  const dt = Math.min(0.1, (now - lastFrameTime) / 1000);
-  lastFrameTime = now;
-  if (!inMatch || !predicted.initialized) return;
 
-  let vx = 0, vy = 0;
-  if (keys.up) vy -= 1;
-  if (keys.down) vy += 1;
-  if (keys.left) vx -= 1;
-  if (keys.right) vx += 1;
+  const now =
+    Date.now();
 
-  const len = Math.sqrt(vx * vx + vy * vy);
-  if (len > 0) {
-    vx = (vx / len) * PLAYER_SPEED * dt;
-    vy = (vy / len) * PLAYER_SPEED * dt;
+
+  const dt =
+    Math.min(
+      0.1,
+      (now - lastFrameTime) /
+        1000
+    );
+
+
+  lastFrameTime =
+    now;
+
+
+  if (
+    !inMatch ||
+    !predicted.initialized
+  ) {
+
+    return;
+
   }
 
-  predicted.x = Math.max(PLAYER_RADIUS, Math.min(ARENA_W - PLAYER_RADIUS, predicted.x + vx));
-  predicted.y = Math.max(PLAYER_RADIUS, Math.min(ARENA_H - PLAYER_RADIUS, predicted.y + vy));
+
+  let vx = 0;
+  let vy = 0;
+
+
+  if (keys.up) {
+
+    vy -= 1;
+
+  }
+
+
+  if (keys.down) {
+
+    vy += 1;
+
+  }
+
+
+  if (keys.left) {
+
+    vx -= 1;
+
+  }
+
+
+  if (keys.right) {
+
+    vx += 1;
+
+  }
+
+
+  const len =
+    Math.sqrt(
+      vx * vx +
+      vy * vy
+    );
+
+
+  if (len > 0) {
+
+    vx =
+      (vx / len) *
+      PLAYER_SPEED *
+      dt;
+
+    vy =
+      (vy / len) *
+      PLAYER_SPEED *
+      dt;
+
+  }
+
+
+  predicted.x =
+    Math.max(
+      PLAYER_RADIUS,
+      Math.min(
+        ARENA_W -
+          PLAYER_RADIUS,
+        predicted.x + vx
+      )
+    );
+
+
+  predicted.y =
+    Math.max(
+      PLAYER_RADIUS,
+      Math.min(
+        ARENA_H -
+          PLAYER_RADIUS,
+        predicted.y + vy
+      )
+    );
+
 }
+
+
+/* =========================================================
+   RENDER GAME
+========================================================= */
 
 function render() {
+
   applyPrediction();
 
+
   if (inMatch) {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    for (const p of latestState.players) {
-      const isMe = matchInfo && p.id === matchInfo.playerId;
-      const x = isMe ? predicted.x : p.x;
-      const y = isMe ? predicted.y : p.y;
+    ctx.clearRect(
+      0,
+      0,
+      canvas.width,
+      canvas.height
+    );
+
+
+    /* -----------------------------------------------------
+       PLAYERS
+    ----------------------------------------------------- */
+
+    for (
+      const p of latestState.players
+    ) {
+
+      const isMe =
+        matchInfo &&
+        p.id ===
+          matchInfo.playerId;
+
+
+      const x =
+        isMe
+          ? predicted.x
+          : p.x;
+
+
+      const y =
+        isMe
+          ? predicted.y
+          : p.y;
+
 
       ctx.beginPath();
-      ctx.arc(x, y, PLAYER_RADIUS, 0, Math.PI * 2);
-      ctx.fillStyle = isMe ? '#4ade80' : (p.connected ? '#60a5fa' : '#6b7280');
+
+      ctx.arc(
+        x,
+        y,
+        PLAYER_RADIUS,
+        0,
+        Math.PI * 2
+      );
+
+
+      ctx.fillStyle =
+        isMe
+          ? '#4ade80'
+          : (
+              p.connected
+                ? '#60a5fa'
+                : '#6b7280'
+            );
+
+
       ctx.fill();
-      ctx.fillStyle = '#fff';
-      ctx.font = '12px monospace';
-      const tag = p.connected ? '' : ' (disconnected)';
-      ctx.fillText(`P${p.id} (${p.hp}hp) [${p.score}]${tag}`, x - 20, y - 22);
+
+
+      ctx.fillStyle =
+        '#fff';
+
+
+      ctx.font =
+        '12px monospace';
+
+
+      const tag =
+        p.connected
+          ? ''
+          : ' (disconnected)';
+
+
+      ctx.fillText(
+        `P${p.id} (${p.hp}hp) [${p.score}]${tag}`,
+        x - 20,
+        y - 22
+      );
+
     }
 
-    for (const b of latestState.bullets) {
+
+    /* -----------------------------------------------------
+       BULLETS
+    ----------------------------------------------------- */
+
+    for (
+      const b of latestState.bullets
+    ) {
+
       ctx.beginPath();
-      ctx.arc(b.x, b.y, 4, 0, Math.PI * 2);
-      ctx.fillStyle = '#f87171';
+
+      ctx.arc(
+        b.x,
+        b.y,
+        4,
+        0,
+        Math.PI * 2
+      );
+
+
+      ctx.fillStyle =
+        '#f87171';
+
+
       ctx.fill();
+
     }
 
-    // Draw and expire railgun flash lines
-    const now = Date.now();
-    railgunEffects = railgunEffects.filter((fx) => fx.expiresAt > now);
-    for (const fx of railgunEffects) {
+
+    /* -----------------------------------------------------
+       RAILGUN EFFECTS
+    ----------------------------------------------------- */
+
+    const now =
+      Date.now();
+
+
+    railgunEffects =
+      railgunEffects.filter(
+        (fx) =>
+          fx.expiresAt > now
+      );
+
+
+    for (
+      const fx of railgunEffects
+    ) {
+
       ctx.beginPath();
-      ctx.moveTo(fx.from.x, fx.from.y);
-      ctx.lineTo(fx.to.x, fx.to.y);
-      ctx.strokeStyle = fx.hit ? '#fde047' : '#a855f7';
+
+
+      ctx.moveTo(
+        fx.from.x,
+        fx.from.y
+      );
+
+
+      ctx.lineTo(
+        fx.to.x,
+        fx.to.y
+      );
+
+
+      ctx.strokeStyle =
+        fx.hit
+          ? '#fde047'
+          : '#a855f7';
+
+
       ctx.lineWidth = 2;
+
       ctx.stroke();
+
     }
 
-    ctx.fillStyle = '#888';
-    ctx.font = '11px monospace';
-    ctx.fillText(`ping: ${Math.round(myLatencyMs)}ms  (right-click: railgun, lag-compensated)`, 10, 590);
 
-    // ---- Scoreboard (top-right) ----
-    const sorted = [...latestState.players].sort((a, b) => b.score - a.score);
-    ctx.fillStyle = 'rgba(0,0,0,0.5)';
-    ctx.fillRect(canvas.width - 150, 10, 140, 16 + sorted.length * 16);
-    ctx.fillStyle = '#4ade80';
-    ctx.font = 'bold 12px monospace';
-    ctx.fillText('SCORE', canvas.width - 140, 24);
-    ctx.font = '12px monospace';
-    sorted.forEach((p, i) => {
-      ctx.fillStyle = matchInfo && p.id === matchInfo.playerId ? '#4ade80' : '#ccc';
-      ctx.fillText(`P${p.id}`, canvas.width - 140, 40 + i * 16);
-      ctx.fillText(`${p.score}`, canvas.width - 40, 40 + i * 16);
-    });
+    /* -----------------------------------------------------
+       PING
+    ----------------------------------------------------- */
 
-    // ---- Kill feed (top-left, below HUD) ----
-    const now2 = Date.now();
-    killFeed = killFeed.filter((k) => k.expiresAt > now2);
-    ctx.font = '12px monospace';
-    killFeed.forEach((k, i) => {
-      ctx.fillStyle = 'rgba(0,0,0,0.5)';
-      ctx.fillRect(8, 8 + i * 18, ctx.measureText(k.text).width + 12, 16);
-      ctx.fillStyle = '#fde047';
-      ctx.fillText(k.text, 14, 20 + i * 18);
-    });
+    ctx.fillStyle =
+      '#888';
+
+
+    ctx.font =
+      '11px monospace';
+
+
+    ctx.fillText(
+      `ping: ${Math.round(myLatencyMs)}ms  ` +
+      `(right-click: railgun, lag-compensated)`,
+      10,
+      590
+    );
+
+
+    /* -----------------------------------------------------
+       SCOREBOARD
+    ----------------------------------------------------- */
+
+    const sorted =
+      [...latestState.players]
+        .sort(
+          (a, b) =>
+            b.score - a.score
+        );
+
+
+    ctx.fillStyle =
+      'rgba(0,0,0,0.5)';
+
+
+    ctx.fillRect(
+      canvas.width - 150,
+      10,
+      140,
+      16 +
+        sorted.length * 16
+    );
+
+
+    ctx.fillStyle =
+      '#4ade80';
+
+
+    ctx.font =
+      'bold 12px monospace';
+
+
+    ctx.fillText(
+      'SCORE',
+      canvas.width - 140,
+      24
+    );
+
+
+    ctx.font =
+      '12px monospace';
+
+
+    sorted.forEach(
+      (p, i) => {
+
+        ctx.fillStyle =
+          matchInfo &&
+          p.id ===
+            matchInfo.playerId
+            ? '#4ade80'
+            : '#ccc';
+
+
+        ctx.fillText(
+          `P${p.id}`,
+          canvas.width - 140,
+          40 + i * 16
+        );
+
+
+        ctx.fillText(
+          `${p.score}`,
+          canvas.width - 40,
+          40 + i * 16
+        );
+
+      }
+    );
+
+
+    /* -----------------------------------------------------
+       KILL FEED
+    ----------------------------------------------------- */
+
+    const now2 =
+      Date.now();
+
+
+    killFeed =
+      killFeed.filter(
+        (k) =>
+          k.expiresAt > now2
+      );
+
+
+    ctx.font =
+      '12px monospace';
+
+
+    killFeed.forEach(
+      (k, i) => {
+
+        ctx.fillStyle =
+          'rgba(0,0,0,0.5)';
+
+
+        ctx.fillRect(
+          8,
+          8 + i * 18,
+          ctx.measureText(k.text).width +
+            12,
+          16
+        );
+
+
+        ctx.fillStyle =
+          '#fde047';
+
+
+        ctx.fillText(
+          k.text,
+          14,
+          20 + i * 18
+        );
+
+      }
+    );
+
   }
 
-  requestAnimationFrame(render);
+
+  requestAnimationFrame(
+    render
+  );
+
 }
+
+
+/* =========================================================
+   START RENDER LOOP
+========================================================= */
+
 render();
+
 </script>
+
 </body>
 </html>
