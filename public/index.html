@@ -94,15 +94,17 @@ mmWs.onmessage = (event) => {
 
   if (msg.type === 'match_assigned') {
     matchInfo = { sessionId: msg.sessionId, playerId: msg.playerId, token: msg.token, server: msg.server };
-    lobbyStatus.textContent = `Match found on ${msg.server.host}:${msg.server.port} — connecting...`;
-    connectToGameServer();
+lobbyStatus.textContent =
+  `Match found on ${msg.server.id} — connecting...`;   
+   connectToGameServer();
   }
 };
 
 function connectToGameServer() {
   cleanEnd = false;
-  gameWs = new WebSocket(`${matchInfo.server.protocol || 'ws'}://${matchInfo.server.host}:${matchInfo.server.port}`);
-
+gameWs = new WebSocket(
+  matchInfo.server.url
+);
   gameWs.onopen = () => {
     gameWs.send(
       JSON.stringify({
@@ -135,8 +137,8 @@ function connectToGameServer() {
       helpText.style.display = 'block';
       debugBtn.style.display = 'inline-block';
       reconnectBanner.style.display = 'none';
-      hud.textContent = `Match ${msg.sessionId} on ${matchInfo.server.host}:${matchInfo.server.port}`;
-    }
+hud.textContent =
+  `Match ${msg.sessionId} on ${matchInfo.server.id}`;    }
 
     if (msg.type === 'state') {
       latestState = msg;
