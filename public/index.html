@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Stage 3 - Distributed Matchmaking + Reconnection</title>
+<style>
+  body { margin: 0; background: #111; display: flex; flex-direction: column; align-items: center; font-family: monospace; color: #eee; }
+  canvas { background: #1c1c1c; border: 2px solid #444; margin-top: 20px; display: none; }
+  #hud { margin-top: 12px; font-size: 14px; text-align: center; }
+  #lobby { margin-top: 60px; text-align: center; }
+  button { font-family: monospace; font-size: 16px; padding: 10px 24px; background: #4ade80; border: none; border-radius: 6px; cursor: pointer; margin: 4px; }
+  button:disabled { background: #555; cursor: default; }
+  #debugBtn { background: #f59e0b; font-size: 12px; padding: 6px 12px; }
+  .reconnect-banner { background: #7c2d12; color: #fed7aa; padding: 6px 14px; border-radius: 4px; margin-top: 8px; display:none; }
+</style>
+</head>
+<body>
+  <div id="hud">Connecting to matchmaker...</div>
+
+  <div id="lobby">
+    <button id="findMatchBtn" disabled>Find Match</button>
+    <p id="lobbyStatus" style="color:#888"></p>
+  </div>
+
+  <div id="reconnectBanner" class="reconnect-banner">Connection lost — reconnecting to your match...</div>
+  <canvas id="game" width="800" height="600"></canvas>
+  <p id="helpText" style="font-size:13px;color:#888;display:none">WASD to move, click to shoot.</p>
+  <button id="debugBtn" style="display:none">Simulate disconnect (test reconnection)</button>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const hud = document.getElementById('hud');
+const lobby = document.getElementById('lobby');
+const lobbyStatus = document.getElementById('lobbyStatus');
+const findMatchBtn = document.getElementById('findMatchBtn');
+const helpText = document.getElementById('helpText');
+const reconnectBanner = document.getElementById('reconnectBanner');
+const debugBtn = document.getElementById('debugBtn');
+
+// ---- Matchmaker connection (only used to queue) ----
+let mmWs = new WebSocket(`ws://${location.hostname}:9000`);
+
+// ---- Game server connection (created after a match is assigned) ----
+let gameWs = null;
+let myId = null;
+let matchInfo = null; // { sessionId, playerId, token, server }
+let inMatch = false;
+let cleanEnd = false;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 6;
+
+let latestState = { players: [], bullets: [] };
+let railgunEffects = []; // { from, to, hit, expiresAt }
+let killFeed = []; // { text, expiresAt }
+let myLatencyMs = 0;
+let predicted = { x: 400, y: 300, initialized: false };
+const PLAYER_SPEED = 200;
+const PLAYER_RADIUS = 15;
+let ARENA_W = 800, ARENA_H = 600;
+
+mmWs.onopen = () => {
+  hud.textContent = 'Connected to matchmaker. Ready to find a match.';
+  findMatchBtn.disabled = false;
+};
+mmWs.onclose = () => {
+  if (!inMatch) hud.textContent = 'Disconnected from matchmaker.';
+};
+
+findMatchBtn.addEventListener('click', () => {
+  mmWs.send(JSON.stringify({ type: 'find_match' }));
+  findMatchBtn.disabled = true;
+  lobbyStatus.textContent = 'Searching for match...';
+});
+
+mmWs.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+
+  if (msg.type === 'welcome') {
+    myId = msg.id;
+    hud.textContent = `Connected as player ${myId}`;
+  }
+
+  if (msg.type === 'queued') {
+    lobbyStatus.textContent = `In queue (position ${msg.position})...`;
+  }
+
+  if (msg.type === 'match_assigned') {
+    matchInfo = { sessionId: msg.sessionId, playerId: msg.playerId, token: msg.token, server: msg.server };
+    lobbyStatus.textContent = `Match found on ${msg.server.host}:${msg.server.port} — connecting...`;
+    connectToGameServer();
+  }
+};
+
+function connectToGameServer() {
+  cleanEnd = false;
+  gameWs = new WebSocket(`ws://${matchInfo.server.host}:${matchInfo.server.port}`);
+
+  gameWs.onopen = () => {
+    gameWs.send(
+      JSON.stringify({
+        type: 'join_session',
+        sessionId: matchInfo.sessionId,
+        playerId: matchInfo.playerId,
+        token: matchInfo.token,
+      })
+    );
+  };
+
+  gameWs.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+
+    if (msg.type === 'join_failed') {
+      hud.textContent = `Failed to join match: ${msg.reason}`;
+      return;
+    }
+
+    if (msg.type === 'match_found') {
+      ARENA_W = msg.arena.w;
+      ARENA_H = msg.arena.h;
+      inMatch = true;
+      reconnectAttempts = 0;
+      predicted.x = msg.yourState.x;
+      predicted.y = msg.yourState.y;
+      predicted.initialized = true;
+      lobby.style.display = 'none';
+      canvas.style.display = 'block';
+      helpText.style.display = 'block';
+      debugBtn.style.display = 'inline-block';
+      reconnectBanner.style.display = 'none';
+      hud.textContent = `Match ${msg.sessionId} on ${matchInfo.server.host}:${matchInfo.server.port}`;
+    }
+
+    if (msg.type === 'state') {
+      latestState = msg;
+      const serverSelf = msg.players.find((p) => p.id === matchInfo.playerId);
+      if (serverSelf) {
+        const errX = serverSelf.x - predicted.x;
+        const errY = serverSelf.y - predicted.y;
+        const errMag = Math.sqrt(errX * errX + errY * errY);
+        if (errMag > 80) {
+          predicted.x = serverSelf.x;
+          predicted.y = serverSelf.y;
+        } else if (errMag > 2) {
+          predicted.x += errX * 0.2;
+          predicted.y += errY * 0.2;
+        }
+        myLatencyMs = serverSelf.latencyMs || 0;
+      }
+    }
+
+    // Server periodically checks our round-trip time — just echo it back
+    if (msg.type === 'ping') {
+      gameWs.send(JSON.stringify({ type: 'pong', pingId: msg.pingId }));
+    }
+
+    // A railgun (hitscan) shot fired by anyone — draw a brief flash line
+    if (msg.type === 'railgun_shot') {
+      railgunEffects.push({ from: msg.from, to: msg.to, hit: !!msg.hitPlayerId, expiresAt: Date.now() + 180 });
+    }
+
+    if (msg.type === 'match_end') {
+      cleanEnd = true;
+      inMatch = false;
+      canvas.style.display = 'none';
+      helpText.style.display = 'none';
+      debugBtn.style.display = 'none';
+      reconnectBanner.style.display = 'none';
+      lobby.style.display = 'block';
+      findMatchBtn.disabled = false;
+
+      const scoreLines = (msg.finalScores || [])
+        .map((s) => `P${s.id}: ${s.score}${s.id === msg.winnerId ? ' \u2b50' : ''}`)
+        .join('  |  ');
+      lobbyStatus.textContent = `Match ended (${msg.reason}). Final scores — ${scoreLines || 'no kills'}. Ready for another.`;
+      matchInfo = null;
+    }
+
+    if (msg.type === 'kill_feed') {
+      const isRailgun = msg.weapon === 'railgun';
+      killFeed.push({
+        text: `P${msg.killerId} eliminated P${msg.victimId} (${isRailgun ? 'railgun' : 'bullet'})`,
+        expiresAt: Date.now() + 4000,
+      });
+      if (killFeed.length > 5) killFeed.shift();
+    }
+  };
+
+  gameWs.onclose = () => {
+    if (!cleanEnd && inMatch && matchInfo) {
+      attemptReconnect();
+    }
+  };
+}
+
+function attemptReconnect() {
+  reconnectAttempts++;
+  if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+    hud.textContent = 'Could not reconnect to match. Giving up.';
+    reconnectBanner.style.display = 'none';
+    inMatch = false;
+    canvas.style.display = 'none';
+    lobby.style.display = 'block';
+    findMatchBtn.disabled = false;
+    return;
+  }
+  reconnectBanner.style.display = 'block';
+  reconnectBanner.textContent = `Connection lost — reconnecting (attempt ${reconnectAttempts})...`;
+  setTimeout(() => connectToGameServer(), 1000);
+}
+
+// Debug button: forcibly closes the game connection to test the
+// reconnection flow without needing to actually kill your network.
+debugBtn.addEventListener('click', () => {
+  if (gameWs) gameWs.close();
+});
+
+// ---- Input handling ----
+const keys = { up: false, down: false, left: false, right: false };
+let aim = { x: 400, y: 300 };
+
+window.addEventListener('keydown', (e) => setKey(e.code, true));
+window.addEventListener('keyup', (e) => setKey(e.code, false));
+
+function setKey(code, isDown) {
+  if (code === 'KeyW' || code === 'ArrowUp') keys.up = isDown;
+  if (code === 'KeyS' || code === 'ArrowDown') keys.down = isDown;
+  if (code === 'KeyA' || code === 'ArrowLeft') keys.left = isDown;
+  if (code === 'KeyD' || code === 'ArrowRight') keys.right = isDown;
+}
+
+canvas.addEventListener('mousemove', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  aim = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+});
+
+canvas.addEventListener('click', () => {
+  if (inMatch && gameWs && gameWs.readyState === WebSocket.OPEN) {
+    gameWs.send(JSON.stringify({ type: 'shoot' }));
+  }
+});
+
+// Right-click fires the lag-compensated hitscan railgun instead of a projectile
+canvas.addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+  if (inMatch && gameWs && gameWs.readyState === WebSocket.OPEN) {
+    gameWs.send(JSON.stringify({ type: 'railgun' }));
+  }
+});
+
+setInterval(() => {
+  if (inMatch && gameWs && gameWs.readyState === WebSocket.OPEN) {
+    gameWs.send(JSON.stringify({ type: 'input', keys, aim }));
+  }
+}, 50);
+
+let lastFrameTime = Date.now();
+function applyPrediction() {
+  const now = Date.now();
+  const dt = Math.min(0.1, (now - lastFrameTime) / 1000);
+  lastFrameTime = now;
+  if (!inMatch || !predicted.initialized) return;
+
+  let vx = 0, vy = 0;
+  if (keys.up) vy -= 1;
+  if (keys.down) vy += 1;
+  if (keys.left) vx -= 1;
+  if (keys.right) vx += 1;
+
+  const len = Math.sqrt(vx * vx + vy * vy);
+  if (len > 0) {
+    vx = (vx / len) * PLAYER_SPEED * dt;
+    vy = (vy / len) * PLAYER_SPEED * dt;
+  }
+
+  predicted.x = Math.max(PLAYER_RADIUS, Math.min(ARENA_W - PLAYER_RADIUS, predicted.x + vx));
+  predicted.y = Math.max(PLAYER_RADIUS, Math.min(ARENA_H - PLAYER_RADIUS, predicted.y + vy));
+}
+
+function render() {
+  applyPrediction();
+
+  if (inMatch) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    for (const p of latestState.players) {
+      const isMe = matchInfo && p.id === matchInfo.playerId;
+      const x = isMe ? predicted.x : p.x;
+      const y = isMe ? predicted.y : p.y;
+
+      ctx.beginPath();
+      ctx.arc(x, y, PLAYER_RADIUS, 0, Math.PI * 2);
+      ctx.fillStyle = isMe ? '#4ade80' : (p.connected ? '#60a5fa' : '#6b7280');
+      ctx.fill();
+      ctx.fillStyle = '#fff';
+      ctx.font = '12px monospace';
+      const tag = p.connected ? '' : ' (disconnected)';
+      ctx.fillText(`P${p.id} (${p.hp}hp) [${p.score}]${tag}`, x - 20, y - 22);
+    }
+
+    for (const b of latestState.bullets) {
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, 4, 0, Math.PI * 2);
+      ctx.fillStyle = '#f87171';
+      ctx.fill();
+    }
+
+    // Draw and expire railgun flash lines
+    const now = Date.now();
+    railgunEffects = railgunEffects.filter((fx) => fx.expiresAt > now);
+    for (const fx of railgunEffects) {
+      ctx.beginPath();
+      ctx.moveTo(fx.from.x, fx.from.y);
+      ctx.lineTo(fx.to.x, fx.to.y);
+      ctx.strokeStyle = fx.hit ? '#fde047' : '#a855f7';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    ctx.fillStyle = '#888';
+    ctx.font = '11px monospace';
+    ctx.fillText(`ping: ${Math.round(myLatencyMs)}ms  (right-click: railgun, lag-compensated)`, 10, 590);
+
+    // ---- Scoreboard (top-right) ----
+    const sorted = [...latestState.players].sort((a, b) => b.score - a.score);
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(canvas.width - 150, 10, 140, 16 + sorted.length * 16);
+    ctx.fillStyle = '#4ade80';
+    ctx.font = 'bold 12px monospace';
+    ctx.fillText('SCORE', canvas.width - 140, 24);
+    ctx.font = '12px monospace';
+    sorted.forEach((p, i) => {
+      ctx.fillStyle = matchInfo && p.id === matchInfo.playerId ? '#4ade80' : '#ccc';
+      ctx.fillText(`P${p.id}`, canvas.width - 140, 40 + i * 16);
+      ctx.fillText(`${p.score}`, canvas.width - 40, 40 + i * 16);
+    });
+
+    // ---- Kill feed (top-left, below HUD) ----
+    const now2 = Date.now();
+    killFeed = killFeed.filter((k) => k.expiresAt > now2);
+    ctx.font = '12px monospace';
+    killFeed.forEach((k, i) => {
+      ctx.fillStyle = 'rgba(0,0,0,0.5)';
+      ctx.fillRect(8, 8 + i * 18, ctx.measureText(k.text).width + 12, 16);
+      ctx.fillStyle = '#fde047';
+      ctx.fillText(k.text, 14, 20 + i * 18);
+    });
+  }
+
+  requestAnimationFrame(render);
+}
+render();
+</script>
+</body>
+</html>

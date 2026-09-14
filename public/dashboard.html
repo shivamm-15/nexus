@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Game Infra Dashboard</title>
+<style>
+  body { margin: 0; background: #0a0a0a; color: #e5e5e5; font-family: monospace; padding: 24px; }
+  h1 { font-size: 18px; color: #4ade80; margin-bottom: 4px; }
+  .subtitle { color: #888; font-size: 12px; margin-bottom: 24px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .card { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 16px; }
+  .card h2 { font-size: 14px; margin: 0 0 12px 0; color: #60a5fa; }
+  .card.offline h2 { color: #f87171; }
+  .row { display: flex; justify-content: space-between; font-size: 13px; padding: 3px 0; border-bottom: 1px solid #222; }
+  .row span:last-child { color: #fde047; }
+  canvas.sparkline { width: 100%; height: 40px; margin-top: 8px; }
+  .session-row { font-size: 11px; color: #999; padding: 2px 0; }
+  #config { margin-bottom: 16px; font-size: 12px; color: #888; }
+  #config input { background: #1a1a1a; border: 1px solid #333; color: #eee; font-family: monospace; padding: 4px 8px; border-radius: 4px; width: 320px; }
+</style>
+</head>
+<body>
+  <h1>&#9679; Game Infra Dashboard</h1>
+  <div class="subtitle">Polls each process's /metrics endpoint every second. No external dependencies.</div>
+
+  <div id="config">
+    Endpoints (comma-separated):
+    <input id="endpointsInput" value="http://localhost:10000/metrics,http://localhost:9081/metrics,http://localhost:9082/metrics" />
+    <button id="applyBtn" style="font-family:monospace;">Apply</button>
+  </div>
+
+  <div class="grid" id="grid"></div>
+
+<script>
+const grid = document.getElementById('grid');
+const endpointsInput = document.getElementById('endpointsInput');
+const applyBtn = document.getElementById('applyBtn');
+
+let endpoints = endpointsInput.value.split(',').map((s) => s.trim());
+const history = {}; // url -> array of {t, load or queueLength}
+
+applyBtn.addEventListener('click', () => {
+  endpoints = endpointsInput.value.split(',').map((s) => s.trim()).filter(Boolean);
+  buildCards();
+});
+
+function buildCards() {
+  grid.innerHTML = '';
+  for (const url of endpoints) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.id = 'card-' + btoa(url).replace(/=/g, '');
+    card.innerHTML = `<h2>${url}</h2><div class="body">connecting...</div><canvas class="sparkline"></canvas>`;
+    grid.appendChild(card);
+    if (!history[url]) history[url] = [];
+  }
+}
+buildCards();
+
+function drawSparkline(canvas, values, color) {
+  const ctx = canvas.getContext('2d');
+  const w = (canvas.width = canvas.clientWidth);
+  const h = (canvas.height = 40);
+  ctx.clearRect(0, 0, w, h);
+  if (values.length < 2) return;
+  const max = Math.max(1, ...values);
+  ctx.beginPath();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  values.forEach((v, i) => {
+    const x = (i / (values.length - 1)) * w;
+    const y = h - (v / max) * h;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+}
+
+async function poll() {
+  for (const url of endpoints) {
+    const cardId = 'card-' + btoa(url).replace(/=/g, '');
+    const card = document.getElementById(cardId);
+    if (!card) continue;
+    const body = card.querySelector('.body');
+    const canvas = card.querySelector('.sparkline');
+
+    try {
+      const res = await fetch(url, { cache: 'no-store' });
+      const data = await res.json();
+      card.classList.remove('offline');
+
+      const isMatchmaker = 'queueLength' in data;
+      const trackValue = isMatchmaker ? data.queueLength : data.load;
+      history[url].push(trackValue);
+      if (history[url].length > 60) history[url].shift();
+
+      if (isMatchmaker) {
+        body.innerHTML = `
+          <div class="row"><span>Queue length</span><span>${data.queueLength}</span></div>
+          <div class="row"><span>Matches formed</span><span>${data.matchesFormed}</span></div>
+          <div class="row"><span>Players matched</span><span>${data.totalPlayersMatched}</span></div>
+          <div class="row"><span>Avg wait to match</span><span>${data.avgAssignmentWaitMs}ms</span></div>
+          <div class="row"><span>Uptime</span><span>${data.uptimeSec}s</span></div>
+        `;
+      } else {
+        const sessionRows = data.sessions
+          .map((s) => `<div class="session-row">session ${s.id}: ${s.players} players, tick avg ${s.avgTickMs}ms / max ${s.maxTickMs}ms</div>`)
+          .join('');
+        body.innerHTML = `
+          <div class="row"><span>Server id</span><span>${data.id}</span></div>
+          <div class="row"><span>Current load</span><span>${data.load} players</span></div>
+          <div class="row"><span>Active sessions</span><span>${data.activeSessions}</span></div>
+          <div class="row"><span>Uptime</span><span>${data.uptimeSec}s</span></div>
+          ${sessionRows}
+        `;
+      }
+      drawSparkline(canvas, history[url], '#4ade80');
+    } catch (e) {
+      card.classList.add('offline');
+      body.innerHTML = `<div class="row"><span>offline / unreachable</span><span></span></div>`;
+    }
+  }
+}
+
+setInterval(poll, 1000);
+poll();
+</script>
+</body>
+</html>
