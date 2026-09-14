@@ -39,7 +39,14 @@ const reconnectBanner = document.getElementById('reconnectBanner');
 const debugBtn = document.getElementById('debugBtn');
 
 // ---- Matchmaker connection (only used to queue) ----
-let mmWs = new WebSocket(`ws://${location.hostname}:9000`);
+// ---- Deployment config ----
+// Locally this just works. After you deploy the matchmaker somewhere
+// public, replace the string below with its real wss:// URL — everything
+// else (which game server to connect to, ws vs wss) is told to the client
+// by the matchmaker automatically, so this is the ONE line you need to edit.
+const MATCHMAKER_URL = 'wss://matchmaker-6wmh.onrender.com'; // deployed matchmaker
+
+let mmWs = new WebSocket(MATCHMAKER_URL);
 
 // ---- Game server connection (created after a match is assigned) ----
 let gameWs = null;
@@ -94,7 +101,7 @@ mmWs.onmessage = (event) => {
 
 function connectToGameServer() {
   cleanEnd = false;
-  gameWs = new WebSocket(`ws://${matchInfo.server.host}:${matchInfo.server.port}`);
+  gameWs = new WebSocket(`${matchInfo.server.protocol || 'ws'}://${matchInfo.server.host}:${matchInfo.server.port}`);
 
   gameWs.onopen = () => {
     gameWs.send(
